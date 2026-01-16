@@ -245,3 +245,67 @@ Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerName As String
 
     FindHeaderCol = 0
 End Function
+
+
+Option Explicit
+
+Sub Audit_PremEffDate()
+
+    Const SHEET_NAME As String = "Auto_Selected"  ' change to "IQ_Prep_2" if you want
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+
+    Dim colPremEff As Long
+    colPremEff = FindHeaderCol(ws, "Prem Eff Date")
+    If colPremEff = 0 Then
+        MsgBox "'Prem Eff Date' header not found on " & SHEET_NAME, vbCritical
+        Exit Sub
+    End If
+
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+
+    Dim cutoff As Date
+    cutoff = DateAdd("yyyy", -2, Date)
+
+    Dim r As Long
+    Dim v As Variant
+    Dim parseable As Long, geCutoff As Long, ltCutoff As Long, blanks As Long
+
+    For r = 2 To lastRow
+        v = ws.Cells(r, colPremEff).Value
+
+        If Len(Trim$(CStr(v))) = 0 Then
+            blanks = blanks + 1
+        ElseIf IsDate(v) Then
+            parseable = parseable + 1
+            If CDate(v) >= cutoff Then
+                geCutoff = geCutoff + 1
+            Else
+                ltCutoff = ltCutoff + 1
+            End If
+        Else
+            ' not blank and not parseable
+        End If
+    Next r
+
+    MsgBox "Cutoff (Today - 2 years): " & Format$(cutoff, "yyyy-mm-dd") & vbCrLf & vbCrLf & _
+           "Rows: " & (lastRow - 1) & vbCrLf & _
+           "Blank Prem Eff Date: " & blanks & vbCrLf & _
+           "Parseable as date: " & parseable & vbCrLf & _
+           "   >= cutoff (eligible by date): " & geCutoff & vbCrLf & _
+           "   < cutoff (too old): " & ltCutoff, vbInformation
+
+End Sub
+
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerName As String) As Long
+    Dim lastCol As Long, c As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        If LCase$(Trim$(CStr(ws.Cells(1, c).Value2))) = LCase$(headerName) Then
+            FindHeaderCol = c
+            Exit Function
+        End If
+    Next c
+    FindHeaderCol = 0
+End Function

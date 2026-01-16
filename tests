@@ -62,6 +62,12 @@ Public Sub AutoSelect_Tracks_ToNewWorksheet()
                 wsOut.Cells(UBound(outData, 1), UBound(outData, 2))).Value2 = outData
 
     '------------------------------------------------------------
+    ' Recompute lastRow/lastCol for output sheet
+    '------------------------------------------------------------
+    lastCol = wsOut.Cells(1, wsOut.Columns.Count).End(xlToLeft).Column
+    lastRow = wsOut.Cells(wsOut.Rows.Count, 1).End(xlUp).Row
+
+    '------------------------------------------------------------
     ' Locate required columns in OUTPUT
     '------------------------------------------------------------
     Dim colSelected As Long: colSelected = 1
@@ -72,6 +78,17 @@ Public Sub AutoSelect_Tracks_ToNewWorksheet()
     Dim colGroupRank As Long: colGroupRank = FindHeaderCol(wsOut, "Group Rank")
     Dim colMktShare As Long: colMktShare = FindHeaderCol(wsOut, "Market Share")
     Dim colCustNote As Long: colCustNote = FindHeaderCol(wsOut, "Customer Note", False)
+
+    If colPremEff = 0 Or colRenewal = 0 Or colMissing = 0 Or colTierType = 0 _
+       Or colGroupRank = 0 Or colMktShare = 0 Then
+        MsgBox "One or more required columns are missing on the output sheet.", vbCritical
+        GoTo CleanExit
+    End If
+
+    '------------------------------------------------------------
+    ' Prem Eff Date fix: normalize/convert column values to real dates
+    '------------------------------------------------------------
+    NormalizePremEffDates wsOut, colPremEff, lastRow
 
     '------------------------------------------------------------
     ' UX highlighting
@@ -122,6 +139,32 @@ CleanExit:
 
 End Sub
 
+' Converts text-like dates in the Prem Eff Date column into real Excel Date values (when possible).
+Private Sub NormalizePremEffDates(ByVal ws As Worksheet, ByVal colPremEff As Long, ByVal lastRow As Long)
+
+    Dim r As Long
+    Dim v As Variant
+    Dim d As Date
+
+    For r = 2 To lastRow
+
+        v = ws.Cells(r, colPremEff).Value
+
+        If IsDate(v) Then
+            ws.Cells(r, colPremEff).Value = CDate(v)
+        ElseIf VarType(v) = vbString Then
+            On Error Resume Next
+            d = CDate(v)
+            If Err.Number = 0 Then
+                ws.Cells(r, colPremEff).Value = d
+            End If
+            On Error GoTo 0
+        End If
+
+    Next r
+
+End Sub
+
 Private Function IsEligible( _
     ByVal ws As Worksheet, ByVal r As Long, ByVal cutoffDate As Date, _
     ByVal colPremEff As Long, ByVal colRenewal As Long, ByVal colMissing As Long, _
@@ -129,12 +172,12 @@ Private Function IsEligible( _
 
     IsEligible = False
 
-    If Not IsDate(ws.Cells(r, colPremEff).Value2) Then Exit Function
-    If CDate(ws.Cells(r, colPremEff).Value2) > cutoffDate Then Exit Function
+    If Not IsDate(ws.Cells(r, colPremEff).Value) Then Exit Function
+    If CDate(ws.Cells(r, colPremEff).Value) > cutoffDate Then Exit Function
 
-    If LCase$(Trim$(ws.Cells(r, colRenewal).Value2)) = "yes" Then Exit Function
-    If Len(Trim$(ws.Cells(r, colMissing).Value2)) > 0 Then Exit Function
-    If LCase$(Trim$(ws.Cells(r, colTierType).Value2)) = "manual" Then Exit Function
+    If LCase$(Trim$(CStr(ws.Cells(r, colRenewal).Value2))) = "yes" Then Exit Function
+    If Len(Trim$(CStr(ws.Cells(r, colMissing).Value2))) > 0 Then Exit Function
+    If LCase$(Trim$(CStr(ws.Cells(r, colTierType).Value2))) = "manual" Then Exit Function
 
     If Not IsNumeric(ws.Cells(r, colGroupRank).Value2) Then Exit Function
     If CDbl(ws.Cells(r, colGroupRank).Value2) > 10 Then Exit Function

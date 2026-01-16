@@ -1,0 +1,329 @@
+Option Explicit
+
+'================================================================================
+' Auto-select tracks on IQ_Prep_2 using your rules (max 425 selections)
+'
+' UX:
+'   - Adds/ensures a first column named "Selected" with TRUE/FALSE values
+'   - Adds a checkbox per row linked to the Selected cell (user can deselect)
+'   - Highlights:
+'       * "Customer Note" cells if non-empty
+'       * "Tier Type" cells if value = "Mixed"
+'
+' Selection rules:
+'   - Group number = 8  => ALWAYS selected (overrides all other criteria)
+'   - Prem Eff Date > (today + 2 years) => cannot be selected
+'   - Renewal Only = "Yes"              => cannot be selected
+'   - Missing Data not empty            => cannot be selected
+'   - Tier Type = "Manual"              => cannot be selected
+'   - Group Rank > 10                   => cannot be selected
+'   - Market Share < 0.02               => cannot be selected
+'
+' Notes:
+'   - We select all Group 8 first.
+'   - Then we select additional eligible rows top-to-bottom until we reach 425.
+'   - If mandatory Group 8 alone exceeds 425, we still select them and warn.
+'================================================================================
+Public Sub AutoSelect_Tracks_IQ_Prep_2()
+
+    Const SHEET_NAME As String = "IQ_Prep_2"
+    Const MAX_SELECT As Long = 425
+
+    Dim ws As Worksheet
+    Dim lastRow As Long, lastCol As Long
+    Dim cutoffDate As Date
+    cutoffDate = DateAdd("yyyy", 2, Date)
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+
+    '------------------------------------------------------------
+    ' 1) Get sheet
+    '------------------------------------------------------------
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        MsgBox "Sheet '" & SHEET_NAME & "' not found.", vbCritical
+        GoTo CleanExit
+    End If
+
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lastRow < 2 Then GoTo CleanExit
+
+    '------------------------------------------------------------
+    ' 2) Ensure "Selected" is the first column (col A)
+    '------------------------------------------------------------
+    EnsureSelectedFirstColumn ws
+
+    ' Recompute bounds after potential insert
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+
+    '------------------------------------------------------------
+    ' 3) Find required columns by header
+    '------------------------------------------------------------
+    Dim colSelected As Long: colSelected = FindHeaderCol(ws, "Selected")
+    Dim colGroupNum As Long: colGroupNum = FindHeaderCol(ws, "Group number")
+    Dim colState As Long: colState = FindHeaderCol(ws, "State")
+    Dim colPremEff As Long: colPremEff = FindHeaderCol(ws, "Prem Eff Date")
+    Dim colRenewal As Long: colRenewal = FindHeaderCol(ws, "Renewal Only")
+    Dim colMissing As Long: colMissing = FindHeaderCol(ws, "Missing Data")
+    Dim colTierType As Long: colTierType = FindHeaderCol(ws, "Tier Type")
+    Dim colGroupRank As Long: colGroupRank = FindHeaderCol(ws, "Group Rank")
+    Dim colMktShare As Long: colMktShare = FindHeaderCol(ws, "Market Share")
+
+    ' Optional UX columns (only highlight if present)
+    Dim colCustNote As Long: colCustNote = FindHeaderCol(ws, "Customer Note", False)
+
+    If colSelected = 0 Or colGroupNum = 0 Or colState = 0 Or colPremEff = 0 Or colRenewal = 0 _
+       Or colMissing = 0 Or colTierType = 0 Or colGroupRank = 0 Or colMktShare = 0 Then
+        MsgBox "One or more required columns are missing on IQ_Prep_2.", vbCritical
+        GoTo CleanExit
+    End If
+
+    '------------------------------------------------------------
+    ' 4) Clear prior selections + remove prior checkboxes in Selected column
+    '------------------------------------------------------------
+    ClearSelectedAndCheckboxes ws, colSelected, lastRow
+
+    '------------------------------------------------------------
+    ' 5) UX highlighting (Customer Note non-empty, Tier Type = Mixed)
+    '------------------------------------------------------------
+    ApplyUXHighlighting ws, lastRow, colCustNote, colTierType
+
+    '------------------------------------------------------------
+    ' 6) Selection pass: mandatory Group = 8 first
+    '------------------------------------------------------------
+    Dim selectedCount As Long: selectedCount = 0
+    Dim r As Long
+
+    For r = 2 To lastRow
+        If IsGroupEight(ws.Cells(r, colGroupNum).Value2) Then
+            ws.Cells(r, colSelected).Value2 = True
+            selectedCount = selectedCount + 1
+        End If
+    Next r
+
+    '------------------------------------------------------------
+    ' 7) Selection pass: apply criteria for all other rows until cap
+    '------------------------------------------------------------
+    If selectedCount < MAX_SELECT Then
+        For r = 2 To lastRow
+
+            If selectedCount >= MAX_SELECT Then Exit For
+
+            ' Skip if already selected (Group 8)
+            If CBoolSafe(ws.Cells(r, colSelected).Value2) Then GoTo NextRow
+
+            If IsEligibleNonGroup8(ws, r, cutoffDate, _
+                                   colPremEff, colRenewal, colMissing, colTierType, colGroupRank, colMktShare) Then
+                ws.Cells(r, colSelected).Value2 = True
+                selectedCount = selectedCount + 1
+            End If
+
+NextRow:
+        Next r
+    End If
+
+    '------------------------------------------------------------
+    ' 8) Add checkboxes linked to Selected column
+    '------------------------------------------------------------
+    AddLinkedCheckboxes ws, colSelected, lastRow
+
+    '------------------------------------------------------------
+    ' 9) Warn if Group 8 alone exceeds cap
+    '------------------------------------------------------------
+    If selectedCount > MAX_SELECT Then
+        MsgBox "Selections completed, but mandatory Group number = 8 rows exceed the 425 cap." & vbCrLf & _
+               "Selected count = " & selectedCount & "." & vbCrLf & _
+               "You may need to manually deselect to comply with any external limit.", vbExclamation
+    Else
+        MsgBox "Selections completed. Selected count = " & selectedCount & " (max " & MAX_SELECT & ").", vbInformation
+    End If
+
+CleanExit:
+    Application.EnableEvents = True
+    Application.ScreenUpdating = True
+
+End Sub
+
+'================================================================================
+' Helpers
+'================================================================================
+
+Private Sub EnsureSelectedFirstColumn(ByVal ws As Worksheet)
+    Dim existingCol As Long
+    existingCol = FindHeaderCol(ws, "Selected", False)
+
+    If existingCol = 1 Then Exit Sub
+
+    If existingCol = 0 Then
+        ' Insert new column A and name it Selected
+        ws.Columns(1).Insert Shift:=xlToRight
+        ws.Cells(1, 1).Value2 = "Selected"
+    Else
+        ' Move existing Selected column to the front
+        ws.Columns(existingCol).Cut
+        ws.Columns(1).Insert Shift:=xlToRight
+        Application.CutCopyMode = False
+        ws.Cells(1, 1).Value2 = "Selected"
+    End If
+End Sub
+
+' Find a header column by name (row 1). If required=False, returns 0 if missing.
+Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerName As String, Optional ByVal required As Boolean = True) As Long
+    Dim lastCol As Long, c As Long
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+
+    For c = 1 To lastCol
+        If LCase$(Trim$(CStr(ws.Cells(1, c).Value2))) = LCase$(headerName) Then
+            FindHeaderCol = c
+            Exit Function
+        End If
+    Next c
+
+    If required Then
+        FindHeaderCol = 0
+    Else
+        FindHeaderCol = 0
+    End If
+End Function
+
+Private Sub ClearSelectedAndCheckboxes(ByVal ws As Worksheet, ByVal colSelected As Long, ByVal lastRow As Long)
+    ' Clear Selected values
+    ws.Range(ws.Cells(2, colSelected), ws.Cells(lastRow, colSelected)).ClearContents
+
+    ' Remove existing checkboxes that are linked into the Selected column
+    Dim shp As Shape
+    For Each shp In ws.Shapes
+        If shp.Type = msoFormControl Then
+            If shp.FormControlType = xlCheckBox Then
+                ' Roughly detect if it's in the Selected column by left position
+                If shp.TopLeftCell.Column = colSelected Then
+                    shp.Delete
+                End If
+            End If
+        End If
+    Next shp
+End Sub
+
+Private Sub ApplyUXHighlighting(ByVal ws As Worksheet, ByVal lastRow As Long, ByVal colCustNote As Long, ByVal colTierType As Long)
+    ' Clear previous fills only for the targeted columns (safe + fast)
+    If colCustNote > 0 Then
+        ws.Range(ws.Cells(2, colCustNote), ws.Cells(lastRow, colCustNote)).Interior.ColorIndex = xlNone
+    End If
+    ws.Range(ws.Cells(2, colTierType), ws.Cells(lastRow, colTierType)).Interior.ColorIndex = xlNone
+
+    Dim r As Long
+    For r = 2 To lastRow
+        If colCustNote > 0 Then
+            If Len(Trim$(CStr(ws.Cells(r, colCustNote).Value2))) > 0 Then
+                ws.Cells(r, colCustNote).Interior.Color = RGB(255, 255, 153) ' light yellow
+            End If
+        End If
+
+        If LCase$(Trim$(CStr(ws.Cells(r, colTierType).Value2))) = "mixed" Then
+            ws.Cells(r, colTierType).Interior.Color = RGB(255, 255, 153) ' light yellow
+        End If
+    Next r
+End Sub
+
+Private Function IsGroupEight(ByVal v As Variant) As Boolean
+    If IsNumeric(v) Then
+        IsGroupEight = (CLng(v) = 8)
+    Else
+        IsGroupEight = (Trim$(CStr(v)) = "8")
+    End If
+End Function
+
+Private Function IsEligibleNonGroup8( _
+    ByVal ws As Worksheet, ByVal r As Long, ByVal cutoffDate As Date, _
+    ByVal colPremEff As Long, ByVal colRenewal As Long, ByVal colMissing As Long, _
+    ByVal colTierType As Long, ByVal colGroupRank As Long, ByVal colMktShare As Long) As Boolean
+
+    ' Default
+    IsEligibleNonGroup8 = False
+
+    ' Prem Eff Date: if over 2 years from today => cannot select
+    Dim vDate As Variant: vDate = ws.Cells(r, colPremEff).Value2
+    If IsDate(vDate) Then
+        If CDate(vDate) > cutoffDate Then Exit Function
+    Else
+        ' If not a date, treat as not eligible (conservative)
+        Exit Function
+    End If
+
+    ' Renewal Only: "Yes" => cannot select
+    If LCase$(Trim$(CStr(ws.Cells(r, colRenewal).Value2))) = "yes" Then Exit Function
+
+    ' Missing Data: not empty => cannot select
+    If Len(Trim$(CStr(ws.Cells(r, colMissing).Value2))) > 0 Then Exit Function
+
+    ' Tier Type: "Manual" => cannot select
+    If LCase$(Trim$(CStr(ws.Cells(r, colTierType).Value2))) = "manual" Then Exit Function
+
+    ' Group Rank: > 10 => cannot select
+    Dim vRank As Variant: vRank = ws.Cells(r, colGroupRank).Value2
+    If IsNumeric(vRank) Then
+        If CDbl(vRank) > 10# Then Exit Function
+    ElseIf Len(Trim$(CStr(vRank))) > 0 Then
+        Exit Function
+    End If
+
+    ' Market Share: < 0.02 => cannot select
+    Dim vMS As Variant: vMS = ws.Cells(r, colMktShare).Value2
+    If IsNumeric(vMS) Then
+        If CDbl(vMS) < 0.02 Then Exit Function
+    ElseIf Len(Trim$(CStr(vMS))) > 0 Then
+        Exit Function
+    End If
+
+    ' Passed all rules
+    IsEligibleNonGroup8 = True
+End Function
+
+Private Sub AddLinkedCheckboxes(ByVal ws As Worksheet, ByVal colSelected As Long, ByVal lastRow As Long)
+    Dim r As Long
+    Dim cb As CheckBox
+    Dim cell As Range
+
+    For r = 2 To lastRow
+        Set cell = ws.Cells(r, colSelected)
+
+        ' Add checkbox sized to the cell
+        Set cb = ws.CheckBoxes.Add(cell.Left + 2, cell.Top + 2, cell.Width - 4, cell.Height - 4)
+
+        ' Link checkbox to the cell (TRUE/FALSE)
+        cb.LinkedCell = cell.Address(False, False)
+
+        ' No caption for cleaner UX
+        cb.Caption = ""
+
+        ' Optional: initial value matches the cell
+        If CBoolSafe(cell.Value2) Then
+            cb.Value = xlOn
+        Else
+            cb.Value = xlOff
+        End If
+    Next r
+
+    ' Make column narrow-ish
+    ws.Columns(colSelected).ColumnWidth = 4
+End Sub
+
+Private Function CBoolSafe(ByVal v As Variant) As Boolean
+    On Error GoTo Nope
+    If IsEmpty(v) Then GoTo Nope
+    If VarType(v) = vbBoolean Then
+        CBoolSafe = v
+    ElseIf IsNumeric(v) Then
+        CBoolSafe = (CDbl(v) <> 0)
+    Else
+        CBoolSafe = (LCase$(Trim$(CStr(v))) = "true" Or LCase$(Trim$(CStr(v))) = "yes")
+    End If
+    Exit Function
+Nope:
+    CBoolSafe = False
+End Function

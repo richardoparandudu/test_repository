@@ -12,6 +12,9 @@ Public Sub AutoSelect_Tracks_ToNewWorksheet()
     Dim r As Long, c As Long
     Dim selectedCount As Long
 
+    Dim cutoffDate As Date
+    cutoffDate = DateAdd("yyyy", 2, Date)
+
     Application.ScreenUpdating = False
     Application.EnableEvents = False
 
@@ -67,9 +70,10 @@ Public Sub AutoSelect_Tracks_ToNewWorksheet()
     lastRow = wsOut.Cells(wsOut.Rows.Count, 1).End(xlUp).Row
 
     '------------------------------------------------------------
-    ' Locate required columns in OUTPUT (Prem Eff Date NOT used)
+    ' Locate required columns in OUTPUT
     '------------------------------------------------------------
     Dim colSelected As Long: colSelected = 1
+    Dim colPremEff As Long: colPremEff = FindHeaderCol(wsOut, "Prem Eff Date")
     Dim colRenewal As Long: colRenewal = FindHeaderCol(wsOut, "Renewal Only")
     Dim colMissing As Long: colMissing = FindHeaderCol(wsOut, "Missing Data")
     Dim colTierType As Long: colTierType = FindHeaderCol(wsOut, "Tier Type")
@@ -77,11 +81,17 @@ Public Sub AutoSelect_Tracks_ToNewWorksheet()
     Dim colMktShare As Long: colMktShare = FindHeaderCol(wsOut, "Market Share")
     Dim colCustNote As Long: colCustNote = FindHeaderCol(wsOut, "Customer Note", False)
 
-    If colRenewal = 0 Or colMissing = 0 Or colTierType = 0 _
+    If colPremEff = 0 Or colRenewal = 0 Or colMissing = 0 Or colTierType = 0 _
        Or colGroupRank = 0 Or colMktShare = 0 Then
         MsgBox "One or more required columns are missing on the output sheet.", vbCritical
         GoTo CleanExit
     End If
+
+    '------------------------------------------------------------
+    ' Prem Eff Date fix:
+    ' Normalize Prem Eff Date cells into real Excel dates where possible
+    '------------------------------------------------------------
+    NormalizePremEffDates_Robust wsOut, colPremEff, lastRow
 
     '------------------------------------------------------------
     ' UX highlighting
@@ -104,8 +114,7 @@ Public Sub AutoSelect_Tracks_ToNewWorksheet()
     Next r
 
     '------------------------------------------------------------
-    ' Apply selection criteria (single pass, capped)
-    ' Prem Eff Date logic removed for testing
+    ' Apply selection criteria (single pass, capped) INCLUDING Prem Eff Date rule
     '------------------------------------------------------------
     selectedCount = 0
 
@@ -113,9 +122,9 @@ Public Sub AutoSelect_Tracks_ToNewWorksheet()
 
         If selectedCount >= MAX_SELECT Then Exit For
 
-        If IsEligible_NoPremEff(wsOut, r, _
-                                colRenewal, colMissing, _
-                                colTierType, colGroupRank, colMktShare) Then
+        If IsEligible_WithPremEff(wsOut, r, cutoffDate, _
+                                 colPremEff, colRenewal, colMissing, _
+                                 colTierType, colGroupRank, colMktShare) Then
 
             wsOut.Cells(r, colSelected).Value2 = True
             selectedCount = selectedCount + 1
@@ -124,7 +133,7 @@ Public Sub AutoSelect_Tracks_ToNewWorksheet()
 
     Next r
 
-    MsgBox "Selections completed (Prem Eff Date criteria removed). Selected count = " & selectedCount & _
+    MsgBox "Selections completed. Selected count = " & selectedCount & _
            " (max " & MAX_SELECT & ").", vbInformation
 
 CleanExit:
@@ -133,31 +142,94 @@ CleanExit:
 
 End Sub
 
-Private Function IsEligible_NoPremEff( _
-    ByVal ws As Worksheet, ByVal r As Long, _
-    ByVal colRenewal As Long, ByVal colMissing As Long, _
+' Robust normalization:
+' - Handles real Excel date serials
+' - Handles CDate-able strings
+' - Handles "YYYY-MM-DD" (common export format) even if CDate fails
+Private Sub NormalizePremEffDates_Robust(ByVal ws As Worksheet, ByVal colPremEff As Long, ByVal lastRow As Long)
+
+    Dim r As Long
+    Dim v As Variant
+    Dim s As String
+    Dim y As Long, m As Long, d As Long
+
+    For r = 2 To lastRow
+
+        v = ws.Cells(r, colPremEff).Value2
+
+        ' If it's already numeric date serial, keep it (Excel dates are numbers)
+        If IsNumeric(v) Then
+            ' Only coerce if it looks like a plausible Excel date serial
+            If CDbl(v) > 1000# And CDbl(v) < 60000# Then
+                ws.Cells(r, colPremEff).Value = DateSerial(1899, 12, 30) + CDbl(v)
+            End If
+
+        Else
+            s = Trim$(CStr(ws.Cells(r, colPremEff).Value))
+
+            If Len(s) = 0 Then GoTo NextRow
+
+            ' First try normal conversion
+            On Error Resume Next
+            ws.Cells(r, colPremEff).Value = CDate(s)
+            If Err.Number = 0 Then
+                On Error GoTo 0
+                GoTo NextRow
+            End If
+            Err.Clear
+            On Error GoTo 0
+
+            ' Try parsing YYYY-MM-DD
+            ' Example: 2025-01-16
+            If Len(s) >= 10 Then
+                If Mid$(s, 5, 1) = "-" And Mid$(s, 8, 1) = "-" Then
+                    On Error Resume Next
+                    y = CLng(Left$(s, 4))
+                    m = CLng(Mid$(s, 6, 2))
+                    d = CLng(Mid$(s, 9, 2))
+                    If Err.Number = 0 Then
+                        ws.Cells(r, colPremEff).Value = DateSerial(y, m, d)
+                    End If
+                    On Error GoTo 0
+                End If
+            End If
+        End If
+
+NextRow:
+    Next r
+
+End Sub
+
+Private Function IsEligible_WithPremEff( _
+    ByVal ws As Worksheet, ByVal r As Long, ByVal cutoffDate As Date, _
+    ByVal colPremEff As Long, ByVal colRenewal As Long, ByVal colMissing As Long, _
     ByVal colTierType As Long, ByVal colGroupRank As Long, ByVal colMktShare As Long) As Boolean
 
-    IsEligible_NoPremEff = False
+    IsEligible_WithPremEff = False
 
-    ' Renewal Only = Yes → reject
+    ' Prem Eff Date: if over 2 years from today -> reject
+    ' After normalization, valid dates should pass IsDate(.Value)
+    If Not IsDate(ws.Cells(r, colPremEff).Value) Then Exit Function
+    If CDate(ws.Cells(r, colPremEff).Value) > cutoffDate Then Exit Function
+
+    ' Renewal Only = Yes -> reject
     If LCase$(Trim$(CStr(ws.Cells(r, colRenewal).Value2))) = "yes" Then Exit Function
 
-    ' Missing Data not empty → reject
+    ' Missing Data not empty -> reject
     If Len(Trim$(CStr(ws.Cells(r, colMissing).Value2))) > 0 Then Exit Function
 
-    ' Tier Type = Manual → reject
+    ' Tier Type = Manual -> reject
     If LCase$(Trim$(CStr(ws.Cells(r, colTierType).Value2))) = "manual" Then Exit Function
 
-    ' Group Rank > 10 → reject
+    ' Group Rank > 10 -> reject
     If Not IsNumeric(ws.Cells(r, colGroupRank).Value2) Then Exit Function
     If CDbl(ws.Cells(r, colGroupRank).Value2) > 10 Then Exit Function
 
-    ' Market Share < 0.02 → reject
+    ' Market Share < 0.02 -> reject
     If Not IsNumeric(ws.Cells(r, colMktShare).Value2) Then Exit Function
     If CDbl(ws.Cells(r, colMktShare).Value2) < 0.02 Then Exit Function
 
-    IsEligible_NoPremEff = True
+    IsEligible_WithPremEff = True
 End Function
 
 Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerName As String, Optional ByVal required As Boolean = True) As Long

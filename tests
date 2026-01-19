@@ -1,19 +1,50 @@
 Option Explicit
 
-Public Sub AutoSelect_Tracks_ToNewWorksheet()
+'================================================================================
+' Auto-select tracks with STATE QUOTAS + Mesler-based extra allocation.
+'
+' Source:  IQ_Prep_2
+' Output:  Auto_Selected (new/cleared sheet)
+'
+' Core eligibility criteria (same as before, INCLUDING Prem Eff Date rule):
+'   - Prem Eff Date: reject if MORE than 2 years in the past (PremEff < Today-2y)
+'   - Renewal Only = "Yes"        => reject
+'   - Missing Data not empty      => reject
+'   - Tier Type = "Manual"        => reject
+'   - Group Rank > 10             => reject
+'   - Market Share < 0.02         => reject
+'
+' Selection strategy:
+'   Step 1) Per-state quota: select up to 8 eligible tracks per state
+'           (some states may have fewer eligible; take what you can)
+'   Step 2) If still under 425, allocate remaining selections by states where
+'           "Mesler corp (SNL)" has the highest Market Share, descending.
+'           - Each pass adds at most 1 additional track per state (if available)
+'           - Repeat this pass up to 2 times total.
+'
+' UX:
+'   - Adds new first column "Selected" (TRUE/FALSE values)
+'   - Highlights:
+'       * "Customer Note" cells if non-empty (if column exists)
+'       * "Tier Type" cells if value = "Mixed"
+'================================================================================
+Public Sub AutoSelect_Tracks_StateQuota_ThenMesler()
 
     Const SRC_SHEET As String = "IQ_Prep_2"
     Const OUT_SHEET As String = "Auto_Selected"
     Const MAX_SELECT As Long = 425
+    Const STATE_QUOTA As Long = 8
+    Const MESLER_NAME As String = "mesler corp (snl)"
+    Const MAX_MESLER_PASSES As Long = 2
 
     Dim wsSrc As Worksheet, wsOut As Worksheet
     Dim lastRow As Long, lastCol As Long
     Dim srcData As Variant, outData() As Variant
     Dim r As Long, c As Long
-    Dim selectedCount As Long
 
+    ' "Older than 2 years" cutoff
     Dim cutoffDate As Date
-    cutoffDate = DateAdd("yyyy", 2, Date)
+    cutoffDate = DateAdd("yyyy", -2, Date)
 
     Application.ScreenUpdating = False
     Application.EnableEvents = False
@@ -60,81 +91,167 @@ Public Sub AutoSelect_Tracks_ToNewWorksheet()
         Next c
     Next r
 
-    wsOut.Range(wsOut.Cells(1, 1), _
-                wsOut.Cells(UBound(outData, 1), UBound(outData, 2))).Value2 = outData
+    wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(UBound(outData, 1), UBound(outData, 2))).Value2 = outData
 
-    '------------------------------------------------------------
-    ' Recompute lastRow/lastCol for output sheet
-    '------------------------------------------------------------
+    ' Recompute bounds on output
     lastCol = wsOut.Cells(1, wsOut.Columns.Count).End(xlToLeft).Column
     lastRow = wsOut.Cells(wsOut.Rows.Count, 1).End(xlUp).Row
 
     '------------------------------------------------------------
-    ' Locate required columns in OUTPUT
+    ' Locate columns on OUTPUT
     '------------------------------------------------------------
     Dim colSelected As Long: colSelected = 1
+    Dim colState As Long: colState = FindHeaderCol(wsOut, "State")
     Dim colPremEff As Long: colPremEff = FindHeaderCol(wsOut, "Prem Eff Date")
     Dim colRenewal As Long: colRenewal = FindHeaderCol(wsOut, "Renewal Only")
     Dim colMissing As Long: colMissing = FindHeaderCol(wsOut, "Missing Data")
     Dim colTierType As Long: colTierType = FindHeaderCol(wsOut, "Tier Type")
     Dim colGroupRank As Long: colGroupRank = FindHeaderCol(wsOut, "Group Rank")
     Dim colMktShare As Long: colMktShare = FindHeaderCol(wsOut, "Market Share")
+    Dim colSnlGroup As Long: colSnlGroup = FindHeaderCol(wsOut, "SNL Group Name")
     Dim colCustNote As Long: colCustNote = FindHeaderCol(wsOut, "Customer Note", False)
 
-    If colPremEff = 0 Or colRenewal = 0 Or colMissing = 0 Or colTierType = 0 _
-       Or colGroupRank = 0 Or colMktShare = 0 Then
-        MsgBox "One or more required columns are missing on the output sheet.", vbCritical
+    If colState = 0 Or colPremEff = 0 Or colRenewal = 0 Or colMissing = 0 Or colTierType = 0 _
+       Or colGroupRank = 0 Or colMktShare = 0 Or colSnlGroup = 0 Then
+        MsgBox "Missing one or more required columns on " & OUT_SHEET & _
+               ". Required: State, Prem Eff Date, Renewal Only, Missing Data, Tier Type, Group Rank, Market Share, SNL Group Name.", vbCritical
         GoTo CleanExit
     End If
 
     '------------------------------------------------------------
-    ' Prem Eff Date fix:
-    ' Normalize Prem Eff Date cells into real Excel dates where possible
+    ' Normalize Prem Eff Dates (to make IsDate/CDate consistent)
     '------------------------------------------------------------
     NormalizePremEffDates_Robust wsOut, colPremEff, lastRow
 
     '------------------------------------------------------------
     ' UX highlighting
     '------------------------------------------------------------
-    If colCustNote > 0 Then
-        wsOut.Range(wsOut.Cells(2, colCustNote), wsOut.Cells(lastRow, colCustNote)).Interior.ColorIndex = xlNone
-    End If
-    wsOut.Range(wsOut.Cells(2, colTierType), wsOut.Cells(lastRow, colTierType)).Interior.ColorIndex = xlNone
+    ApplyUXHighlighting wsOut, lastRow, colCustNote, colTierType
+
+    '------------------------------------------------------------
+    ' Precompute:
+    '   1) Eligible rows per state (in sheet order)
+    '   2) Mesler max market share per state
+    '------------------------------------------------------------
+    Dim eligibleByState As Object: Set eligibleByState = CreateObject("Scripting.Dictionary")
+    eligibleByState.CompareMode = 1 ' vbTextCompare
+
+    Dim selectedCountByState As Object: Set selectedCountByState = CreateObject("Scripting.Dictionary")
+    selectedCountByState.CompareMode = 1
+
+    Dim meslerShareByState As Object: Set meslerShareByState = CreateObject("Scripting.Dictionary")
+    meslerShareByState.CompareMode = 1
+
+    Dim st As String, snl As String
+    Dim ms As Variant
 
     For r = 2 To lastRow
-        If colCustNote > 0 Then
-            If Len(Trim$(CStr(wsOut.Cells(r, colCustNote).Value2))) > 0 Then
-                wsOut.Cells(r, colCustNote).Interior.Color = RGB(255, 255, 153)
+
+        st = Trim$(CStr(wsOut.Cells(r, colState).Value2))
+        If Len(st) = 0 Then GoTo NextRowPre
+
+        ' eligible list per state
+        If IsEligible_WithPremEff(wsOut, r, cutoffDate, colPremEff, colRenewal, colMissing, colTierType, colGroupRank, colMktShare) Then
+            If Not eligibleByState.Exists(st) Then
+                eligibleByState.Add st, New Collection
+            End If
+            eligibleByState(st).Add r
+        End If
+
+        ' Mesler max share per state (rank states by Mesler's market share)
+        snl = LCase$(Trim$(CStr(wsOut.Cells(r, colSnlGroup).Value2)))
+        If snl = MESLER_NAME Then
+            ms = wsOut.Cells(r, colMktShare).Value2
+            If IsNumeric(ms) Then
+                If Not meslerShareByState.Exists(st) Then
+                    meslerShareByState.Add st, CDbl(ms)
+                Else
+                    If CDbl(ms) > CDbl(meslerShareByState(st)) Then
+                        meslerShareByState(st) = CDbl(ms)
+                    End If
+                End If
             End If
         End If
 
-        If LCase$(Trim$(CStr(wsOut.Cells(r, colTierType).Value2))) = "mixed" Then
-            wsOut.Cells(r, colTierType).Interior.Color = RGB(255, 255, 153)
-        End If
+NextRowPre:
     Next r
 
     '------------------------------------------------------------
-    ' Apply selection criteria (single pass, capped) INCLUDING Prem Eff Date rule
+    ' Step 1: Per-state quota selection (up to 8 per state)
     '------------------------------------------------------------
-    selectedCount = 0
+    Dim key As Variant
+    Dim i As Long
+    Dim rowNum As Long
 
-    For r = 2 To lastRow
+    Dim selectedTotal As Long: selectedTotal = 0
 
-        If selectedCount >= MAX_SELECT Then Exit For
+    For Each key In eligibleByState.Keys
 
-        If IsEligible_WithPremEff(wsOut, r, cutoffDate, _
-                                 colPremEff, colRenewal, colMissing, _
-                                 colTierType, colGroupRank, colMktShare) Then
+        If selectedTotal >= MAX_SELECT Then Exit For
 
-            wsOut.Cells(r, colSelected).Value2 = True
-            selectedCount = selectedCount + 1
+        st = CStr(key)
+        If Not selectedCountByState.Exists(st) Then selectedCountByState.Add st, 0
 
-        End If
+        For i = 1 To eligibleByState(st).Count
+            If selectedTotal >= MAX_SELECT Then Exit For
+            If CLng(selectedCountByState(st)) >= STATE_QUOTA Then Exit For
 
-    Next r
+            rowNum = CLng(eligibleByState(st)(i))
+            If Not CBoolSafe(wsOut.Cells(rowNum, colSelected).Value2) Then
+                wsOut.Cells(rowNum, colSelected).Value2 = True
+                selectedTotal = selectedTotal + 1
+                selectedCountByState(st) = CLng(selectedCountByState(st)) + 1
+            End If
+        Next i
 
-    MsgBox "Selections completed. Selected count = " & selectedCount & _
-           " (max " & MAX_SELECT & ").", vbInformation
+    Next key
+
+    '------------------------------------------------------------
+    ' Step 2: Allocate remaining selections by Mesler share ranking
+    '   - Up to 2 passes
+    '   - Each pass grants at most 1 additional selection per state (if available)
+    '------------------------------------------------------------
+    If selectedTotal < MAX_SELECT And meslerShareByState.Count > 0 Then
+
+        Dim states() As String, shares() As Double
+        BuildStateShareArrays meslerShareByState, states, shares
+        SortStatesByShareDesc states, shares
+
+        Dim pass As Long
+        For pass = 1 To MAX_MESLER_PASSES
+
+            If selectedTotal >= MAX_SELECT Then Exit For
+
+            Dim sIdx As Long
+            For sIdx = LBound(states) To UBound(states)
+
+                If selectedTotal >= MAX_SELECT Then Exit For
+
+                st = states(sIdx)
+                If Not eligibleByState.Exists(st) Then GoTo NextState
+
+                ' Ensure counter exists
+                If Not selectedCountByState.Exists(st) Then selectedCountByState.Add st, 0
+
+                ' Select ONE additional eligible track for this state (if any remain unselected)
+                rowNum = GetNextUnselectedRowForState(wsOut, colSelected, eligibleByState(st))
+                If rowNum > 0 Then
+                    wsOut.Cells(rowNum, colSelected).Value2 = True
+                    selectedTotal = selectedTotal + 1
+                    selectedCountByState(st) = CLng(selectedCountByState(st)) + 1
+                End If
+
+NextState:
+            Next sIdx
+
+            ' If we made no progress in a full pass, stop early
+            If Not AnyUnselectedRemain(wsOut, colSelected, eligibleByState, states) Then Exit For
+
+        Next pass
+
+    End If
+
+    MsgBox "Selections completed. Selected count = " & selectedTotal & " (max " & MAX_SELECT & ").", vbInformation
 
 CleanExit:
     Application.EnableEvents = True
@@ -142,34 +259,57 @@ CleanExit:
 
 End Sub
 
-' Robust normalization:
-' - Handles real Excel date serials
-' - Handles CDate-able strings
-' - Handles "YYYY-MM-DD" (common export format) even if CDate fails
+'========================
+' Eligibility (with corrected Prem Eff Date rule)
+' Reject if PremEff is older than Today-2y (PremEff < cutoffDate)
+'========================
+Private Function IsEligible_WithPremEff( _
+    ByVal ws As Worksheet, ByVal r As Long, ByVal cutoffDate As Date, _
+    ByVal colPremEff As Long, ByVal colRenewal As Long, ByVal colMissing As Long, _
+    ByVal colTierType As Long, ByVal colGroupRank As Long, ByVal colMktShare As Long) As Boolean
+
+    IsEligible_WithPremEff = False
+
+    If Not IsDate(ws.Cells(r, colPremEff).Value) Then Exit Function
+    If CDate(ws.Cells(r, colPremEff).Value) < cutoffDate Then Exit Function
+
+    If LCase$(Trim$(CStr(ws.Cells(r, colRenewal).Value2))) = "yes" Then Exit Function
+    If Len(Trim$(CStr(ws.Cells(r, colMissing).Value2))) > 0 Then Exit Function
+    If LCase$(Trim$(CStr(ws.Cells(r, colTierType).Value2))) = "manual" Then Exit Function
+
+    If Not IsNumeric(ws.Cells(r, colGroupRank).Value2) Then Exit Function
+    If CDbl(ws.Cells(r, colGroupRank).Value2) > 10 Then Exit Function
+
+    If Not IsNumeric(ws.Cells(r, colMktShare).Value2) Then Exit Function
+    If CDbl(ws.Cells(r, colMktShare).Value2) < 0.02 Then Exit Function
+
+    IsEligible_WithPremEff = True
+End Function
+
+'========================
+' Prem Eff Date normalization (robust)
+'========================
 Private Sub NormalizePremEffDates_Robust(ByVal ws As Worksheet, ByVal colPremEff As Long, ByVal lastRow As Long)
 
     Dim r As Long
-    Dim v As Variant
-    Dim s As String
+    Dim v As Variant, s As String
     Dim y As Long, m As Long, d As Long
 
     For r = 2 To lastRow
 
         v = ws.Cells(r, colPremEff).Value2
 
-        ' If it's already numeric date serial, keep it (Excel dates are numbers)
+        ' If numeric, try to treat as Excel date serial
         If IsNumeric(v) Then
-            ' Only coerce if it looks like a plausible Excel date serial
             If CDbl(v) > 1000# And CDbl(v) < 60000# Then
                 ws.Cells(r, colPremEff).Value = DateSerial(1899, 12, 30) + CDbl(v)
             End If
 
         Else
             s = Trim$(CStr(ws.Cells(r, colPremEff).Value))
-
             If Len(s) = 0 Then GoTo NextRow
 
-            ' First try normal conversion
+            ' Try standard conversion
             On Error Resume Next
             ws.Cells(r, colPremEff).Value = CDate(s)
             If Err.Number = 0 Then
@@ -179,8 +319,7 @@ Private Sub NormalizePremEffDates_Robust(ByVal ws As Worksheet, ByVal colPremEff
             Err.Clear
             On Error GoTo 0
 
-            ' Try parsing YYYY-MM-DD
-            ' Example: 2025-01-16
+            ' Try YYYY-MM-DD
             If Len(s) >= 10 Then
                 If Mid$(s, 5, 1) = "-" And Mid$(s, 8, 1) = "-" Then
                     On Error Resume Next
@@ -200,38 +339,97 @@ NextRow:
 
 End Sub
 
-Private Function IsEligible_WithPremEff( _
-    ByVal ws As Worksheet, ByVal r As Long, ByVal cutoffDate As Date, _
-    ByVal colPremEff As Long, ByVal colRenewal As Long, ByVal colMissing As Long, _
-    ByVal colTierType As Long, ByVal colGroupRank As Long, ByVal colMktShare As Long) As Boolean
+'========================
+' UX highlighting
+'========================
+Private Sub ApplyUXHighlighting(ByVal ws As Worksheet, ByVal lastRow As Long, ByVal colCustNote As Long, ByVal colTierType As Long)
+    If colCustNote > 0 Then
+        ws.Range(ws.Cells(2, colCustNote), ws.Cells(lastRow, colCustNote)).Interior.ColorIndex = xlNone
+    End If
+    ws.Range(ws.Cells(2, colTierType), ws.Cells(lastRow, colTierType)).Interior.ColorIndex = xlNone
 
-    IsEligible_WithPremEff = False
+    Dim r As Long
+    For r = 2 To lastRow
+        If colCustNote > 0 Then
+            If Len(Trim$(CStr(ws.Cells(r, colCustNote).Value2))) > 0 Then
+                ws.Cells(r, colCustNote).Interior.Color = RGB(255, 255, 153)
+            End If
+        End If
 
-    ' Prem Eff Date: if over 2 years from today -> reject
-    ' After normalization, valid dates should pass IsDate(.Value)
-    If Not IsDate(ws.Cells(r, colPremEff).Value) Then Exit Function
-    If CDate(ws.Cells(r, colPremEff).Value) > cutoffDate Then Exit Function
+        If LCase$(Trim$(CStr(ws.Cells(r, colTierType).Value2))) = "mixed" Then
+            ws.Cells(r, colTierType).Interior.Color = RGB(255, 255, 153)
+        End If
+    Next r
+End Sub
 
-    ' Renewal Only = Yes -> reject
-    If LCase$(Trim$(CStr(ws.Cells(r, colRenewal).Value2))) = "yes" Then Exit Function
+'========================
+' State/share array build + sorting (desc)
+'========================
+Private Sub BuildStateShareArrays(ByVal dict As Object, ByRef states() As String, ByRef shares() As Double)
+    Dim n As Long: n = dict.Count
+    ReDim states(0 To n - 1)
+    ReDim shares(0 To n - 1)
 
-    ' Missing Data not empty -> reject
-    If Len(Trim$(CStr(ws.Cells(r, colMissing).Value2))) > 0 Then Exit Function
+    Dim i As Long: i = 0
+    Dim k As Variant
+    For Each k In dict.Keys
+        states(i) = CStr(k)
+        shares(i) = CDbl(dict(k))
+        i = i + 1
+    Next k
+End Sub
 
-    ' Tier Type = Manual -> reject
-    If LCase$(Trim$(CStr(ws.Cells(r, colTierType).Value2))) = "manual" Then Exit Function
+Private Sub SortStatesByShareDesc(ByRef states() As String, ByRef shares() As Double)
+    Dim i As Long, j As Long
+    Dim tmpS As String, tmpD As Double
 
-    ' Group Rank > 10 -> reject
-    If Not IsNumeric(ws.Cells(r, colGroupRank).Value2) Then Exit Function
-    If CDbl(ws.Cells(r, colGroupRank).Value2) > 10 Then Exit Function
+    For i = LBound(shares) To UBound(shares) - 1
+        For j = i + 1 To UBound(shares)
+            If shares(j) > shares(i) Then
+                tmpD = shares(i): shares(i) = shares(j): shares(j) = tmpD
+                tmpS = states(i): states(i) = states(j): states(j) = tmpS
+            End If
+        Next j
+    Next i
+End Sub
 
-    ' Market Share < 0.02 -> reject
-    If Not IsNumeric(ws.Cells(r, colMktShare).Value2) Then Exit Function
-    If CDbl(ws.Cells(r, colMktShare).Value2) < 0.02 Then Exit Function
-
-    IsEligible_WithPremEff = True
+'========================
+' Get next unselected eligible row (by precomputed eligible rows collection)
+'========================
+Private Function GetNextUnselectedRowForState(ByVal ws As Worksheet, ByVal colSelected As Long, ByVal eligibleRows As Collection) As Long
+    Dim i As Long, rowNum As Long
+    For i = 1 To eligibleRows.Count
+        rowNum = CLng(eligibleRows(i))
+        If Not CBoolSafe(ws.Cells(rowNum, colSelected).Value2) Then
+            GetNextUnselectedRowForState = rowNum
+            Exit Function
+        End If
+    Next i
+    GetNextUnselectedRowForState = 0
 End Function
 
+' After a pass, if no unselected remain in any Mesler-ranked state, we can stop early.
+Private Function AnyUnselectedRemain(ByVal ws As Worksheet, ByVal colSelected As Long, ByVal eligibleByState As Object, ByVal states() As String) As Boolean
+    Dim sIdx As Long, st As String
+    Dim rowNum As Long
+
+    For sIdx = LBound(states) To UBound(states)
+        st = states(sIdx)
+        If eligibleByState.Exists(st) Then
+            rowNum = GetNextUnselectedRowForState(ws, colSelected, eligibleByState(st))
+            If rowNum > 0 Then
+                AnyUnselectedRemain = True
+                Exit Function
+            End If
+        End If
+    Next sIdx
+
+    AnyUnselectedRemain = False
+End Function
+
+'========================
+' Header finder
+'========================
 Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerName As String, Optional ByVal required As Boolean = True) As Long
     Dim lastCol As Long, c As Long
     lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
@@ -246,66 +444,17 @@ Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerName As String
     FindHeaderCol = 0
 End Function
 
-
-Option Explicit
-
-Sub Audit_PremEffDate()
-
-    Const SHEET_NAME As String = "Auto_Selected"  ' change to "IQ_Prep_2" if you want
-    Dim ws As Worksheet
-    Set ws = ThisWorkbook.Worksheets(SHEET_NAME)
-
-    Dim colPremEff As Long
-    colPremEff = FindHeaderCol(ws, "Prem Eff Date")
-    If colPremEff = 0 Then
-        MsgBox "'Prem Eff Date' header not found on " & SHEET_NAME, vbCritical
-        Exit Sub
+Private Function CBoolSafe(ByVal v As Variant) As Boolean
+    On Error GoTo Nope
+    If IsEmpty(v) Then GoTo Nope
+    If VarType(v) = vbBoolean Then
+        CBoolSafe = v
+    ElseIf IsNumeric(v) Then
+        CBoolSafe = (CDbl(v) <> 0)
+    Else
+        CBoolSafe = (LCase$(Trim$(CStr(v))) = "true" Or LCase$(Trim$(CStr(v))) = "yes")
     End If
-
-    Dim lastRow As Long
-    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-
-    Dim cutoff As Date
-    cutoff = DateAdd("yyyy", -2, Date)
-
-    Dim r As Long
-    Dim v As Variant
-    Dim parseable As Long, geCutoff As Long, ltCutoff As Long, blanks As Long
-
-    For r = 2 To lastRow
-        v = ws.Cells(r, colPremEff).Value
-
-        If Len(Trim$(CStr(v))) = 0 Then
-            blanks = blanks + 1
-        ElseIf IsDate(v) Then
-            parseable = parseable + 1
-            If CDate(v) >= cutoff Then
-                geCutoff = geCutoff + 1
-            Else
-                ltCutoff = ltCutoff + 1
-            End If
-        Else
-            ' not blank and not parseable
-        End If
-    Next r
-
-    MsgBox "Cutoff (Today - 2 years): " & Format$(cutoff, "yyyy-mm-dd") & vbCrLf & vbCrLf & _
-           "Rows: " & (lastRow - 1) & vbCrLf & _
-           "Blank Prem Eff Date: " & blanks & vbCrLf & _
-           "Parseable as date: " & parseable & vbCrLf & _
-           "   >= cutoff (eligible by date): " & geCutoff & vbCrLf & _
-           "   < cutoff (too old): " & ltCutoff, vbInformation
-
-End Sub
-
-Private Function FindHeaderCol(ByVal ws As Worksheet, ByVal headerName As String) As Long
-    Dim lastCol As Long, c As Long
-    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
-    For c = 1 To lastCol
-        If LCase$(Trim$(CStr(ws.Cells(1, c).Value2))) = LCase$(headerName) Then
-            FindHeaderCol = c
-            Exit Function
-        End If
-    Next c
-    FindHeaderCol = 0
+    Exit Function
+Nope:
+    CBoolSafe = False
 End Function
